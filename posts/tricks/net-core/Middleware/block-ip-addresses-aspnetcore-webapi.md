@@ -138,9 +138,145 @@ public class IpBlockMiddelware
 }
 ```
 
+First, we inject `RequestDelegate`, which is a function that can process an HTTP request. It represents the next delegate in the pipeline that will handle the HTTP request.
 
+Also, we inject the `IIpBlockingService` interface.
 
+Next, `Invoke()` takes the current HttpContext as a parameter, which allows us to retrieve the current request’s IP address through `context.Connection.RemoteIpAddress`.
 
+Then, we pass this IP address to the `IsBlocked()` method to verify if the IP should be blocked, and if it should, we set `context.Response.StatusCode` to Forbidden and return from the method.
 
+Finally, if the IP address is not blocked, we call Invoke() on RequestDelegate to ensure the request continues through the rest of the middleware pipeline.
 
+With our middleware defined, we add it to the pipeline in the `Program` class:
 
+```csharp
+var app = builder.Build();
+
+app.UseMiddleware<IpBlockMiddelware>();
+
+// other middleware...
+```
+
+Now we are ready to test the IP blocking functionality.
+
+## Test Middleware With ngrok
+
+To demonstrate the IP address blocking, we can use the reverse proxy tool ngrok. This allows us to tunnel our locally running application to the public-facing internet. Ngrok will provide us with a URL that we can make requests to, which will, in turn, be forwarded to localhost. It also provides a public IP address that we can add to our blocklist to verify our IP blocking is working as expected.
+
+With ngrok installed, we create a tunnel to our locally running application: 
+
+```ts
+ngrok http https://localhost:7116
+```
+
+To ensure we receive the correct IP address in our middleware, we forward the `XForwardedFor` and `XForwardedProto` headers in `Program`:
+
+```csharp
+var app = builder.Build(); 
+
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
+
+app.UseMiddleware<IpBlockMiddelware>(); 
+
+// other middleware...
+```
+
+We add `app.UseForwardedHeaders()` to our middleware pipeline, ensuring to call it before the `IpBlockMiddleware`.
+
+Now, we can run our application and navigate to `http://127.0.0.1:4040`, which is a web interface provided by ngrok. Here we will see a randomly generated URL, which looks similar to `https://<random-string>.eu.ngrok.io`.
+
+We can make a request to `https://<random-string>.eu.ngrok.io/api/ipblock/unblocked` and will receive Unblocked access as our response, showing that we can successfully make requests to our application.
+
+In the ngrok web interface, we find an IP address:
+
+![image](https://user-images.githubusercontent.com/11207864/195809605-b89f9e0b-bd1e-4fad-a2fb-42a4b07ef97d.png)
+
+Let’s add this to our `BlockedIPs `setting (if not using ngrok, you would add `::1` here for `localhost`):
+
+```
+"BlockedIPs": "84.13.150.143"
+```
+
+When we run our application again and make the same request, we will receive a 403 Forbidden response, which will be the same for any endpoint we make a request to.
+
+Now that we’ve seen how to block all requests to our application, let’s look at how to do it selectively with action filters.
+
+## Create an Action Filter For Blocking IP Addresses
+
+We start by creating `IpBlockActionFilter`:
+
+```csharp
+public class IpBlockActionFilter : ActionFilterAttribute
+{
+    private readonly IIpBlockingService _blockingService;
+
+    public IpBlockActionFilter(IIpBlockingService blockingService)
+    {
+        _blockingService = blockingService;
+    }
+
+    public override void OnActionExecuting(ActionExecutingContext context)
+    {
+        var remoteIp = context.HttpContext.Connection.RemoteIpAddress;
+
+        var isBlocked = _blockingService.IsBlocked(remoteIp!); 
+
+        if (isBlocked)
+        {
+            context.Result = new StatusCodeResult(StatusCodes.Status403Forbidden);
+            return;
+        }
+
+        base.OnActionExecuting(context);
+    }
+}
+```
+
+First, we inherit from `ActionFilterAttribute`. Once again, we need our `IIpBlockingService` so we inject it through the constructor.
+
+Next, we override `OnActionExecuting()`, and like our middleware, check if the `RemoteIpAddress` is blocked, setting `context.Result` to `Forbidden` if so.
+
+Finally, we call `base.OnActionExecuting()` to ensure the base class method is called.
+
+Also, we need to register the action filter as a scoped service in the `Program` class:
+
+```
+builder.Services.AddScoped<IpBlockActionFilter>();
+```
+
+## Test the Action Filter
+
+With our custom action filter created, we’ll revisit `IpBlockController` and add it to the blocked endpoint:
+
+```csharp
+[ServiceFilter(typeof(IpBlockActionFilter))]
+[HttpGet("blocked")]
+public string Blocked()
+{
+    return "Blocked access";
+}
+
+Also, we still have our middleware enabled, so we can simply comment out the middleware registration in the `Program` class:
+
+```csharp
+var app = builder.Build();
+
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
+
+//app.UseMiddleware<IpBlockMiddelware>();
+```
+
+Running our application again and navigating to api/ipblock/unblocked, we receive Unblocked access as we expect.
+
+However, if we attempt to make a request to api/ipblock/blocked we receive a 403 Forbidden, due to our action filter.
+
+# Conclusion & Thanks
+
+In this article, we looked at different ways to block IP addresses from making requests to our applications, which can be very useful when we want to ensure we only allow a certain list of users to access our application or block known malicious threats.
